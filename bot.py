@@ -2,8 +2,9 @@
 
 Команды в Telegram:
   /start  — приветствие (и ваш Telegram ID для файла .env)
-  /next   — следующий салон с готовым текстом
-  /stats  — сколько найдено и написано
+  /next    — следующий салон с готовым текстом
+  /regions — выбрать города/регионы для поиска
+  /stats   — сколько найдено и написано
 """
 import html
 import json
@@ -33,7 +34,9 @@ NICHE = os.getenv("NICHE", "beauty_salons").strip()
 QUEUE_SIZE = int(os.getenv("QUEUE_SIZE", "5"))
 
 niche = json.load(open(f"niches/{NICHE}.json", encoding="utf-8"))
-DEFAULT_LANG = niche["text"].get("default_language", "hy")
+CITIES = {c["id"]: c for c in niche["search"]["cities"]}          # ID города -> его настройки
+COUNTRIES = niche["search"].get("countries", {"AM": "Армения"})    # код страны -> название
+SETTING_CITIES = f"cities:{NICHE}"
 
 db.connect()
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -45,7 +48,38 @@ state = {"search": "ещё не запускался", "error": ""}
 # Мобильные коды Армении: на такие номера можно писать в WhatsApp/Telegram
 MOBILE_CODES = {"33", "41", "43", "44", "47", "49", "55", "77", "91", "93", "94", "95", "96", "97", "98", "99"}
 LANG_LABEL = {"hy": "армянский", "ru": "русский"}
+LANG_BUTTON = {"hy": "Текст на армянском", "ru": "Текст на русском"}
 DONE_LABEL = {"w": ("written", "✅ Написал"), "s": ("skipped", "⏭ Пропущен"), "r": ("rejected", "🚫 Не подходит")}
+
+
+# ---------------- регионы ----------------
+
+def selected():
+    """ID выбранных городов (сохраняются в базе, переживают перезапуск)."""
+    raw = db.get_setting(SETTING_CITIES)
+    ids = json.loads(raw) if raw else niche["search"].get("default_cities", [next(iter(CITIES))])
+    return [i for i in ids if i in CITIES]
+
+
+def set_selected(ids):
+    db.set_setting(SETTING_CITIES, json.dumps([i for i in CITIES if i in ids]))
+
+
+def city_of(p):
+    return CITIES.get(p["city"]) or next(iter(CITIES.values()))
+
+
+def langs_for(p):
+    """Языки текста для салона: для Армении армянский и русский, для России только русский."""
+    return niche["text"].get("languages", {}).get(city_of(p).get("country", "AM"), ["ru"])
+
+
+def default_lang(p):
+    return langs_for(p)[0]
+
+
+def selected_names():
+    return ", ".join(CITIES[i]["name"] for i in selected()) or "не выбраны"
 
 
 # ---------------- тексты и очередь ----------------
@@ -68,18 +102,18 @@ def make_text(place_id, lang):
 
 def prepare_one():
     """Пишет текст для одного найденного салона. True — если было что готовить."""
-    p = db.first_with_status(NICHE, "new")
+    p = db.first_with_status(NICHE, "new", selected())
     if p is None:
         return False
-    make_text(p["id"], DEFAULT_LANG)
+    make_text(p["id"], default_lang(p))
     db.change_status(p["id"], "new", "ready")
     return True
 
 
 def take_next():
-    """Берёт следующий готовый салон и помечает его показанным (чтобы не было повторов)."""
+    """Берёт следующий готовый салон из выбранных регионов и помечает его показанным (без повторов)."""
     while True:
-        p = db.first_with_status(NICHE, "ready")
+        p = db.first_with_status(NICHE, "ready", selected())
         if p is None:
             return None
         if db.change_status(p["id"], "ready", "shown"):
@@ -90,15 +124,16 @@ def worker():
     """Фон: держит в очереди QUEUE_SIZE готовых салонов."""
     while True:
         try:
-            if db.count_status(NICHE, "ready") < QUEUE_SIZE and offer_filled():
+            sel = selected()
+            if sel and db.count_status(NICHE, "ready", sel) < QUEUE_SIZE and offer_filled():
                 if prepare_one():
                     state["error"] = ""
                     continue
                 state["search"] = "загружаю салоны из открытых карт…"
-                res = finder.find_more(NICHE, niche)
+                res = finder.find_more(NICHE, niche, sel)
                 if res == finder.EXHAUSTED:
-                    state["search"] = ("все салоны из файла ниши загружены. Новые появятся с выпуском "
-                                       "Overture (раз в месяц) или добавьте город в файл ниши")
+                    state["search"] = ("все выбранные регионы загружены. Новые салоны появятся с выпуском "
+                                       "Overture (раз в месяц), или выберите ещё регионы: /regions")
                 else:
                     state["search"] = f"последняя загрузка: +{res} подходящих"
                     state["error"] = ""
@@ -120,7 +155,9 @@ def esc(s):
 
 def card_text(p, lang):
     text = p["text_hy"] if lang == "hy" else p["text_ru"]
-    lines = [f"<b>{esc(p['name'])}</b>", f"📍 {esc(p['address'])}"]
+    city = city_of(p)["name"]
+    address = f"{city}, {p['address']}" if p["address"] else city
+    lines = [f"<b>{esc(p['name'])}</b>", f"📍 {esc(address)}"]
     if p["phone"]:
         lines.append(f"📞 {esc(p['phone'])}")
     if p["social_url"]:
@@ -133,8 +170,14 @@ def card_text(p, lang):
 
 
 def mobile_digits(phone):
+    """Цифры мобильного номера (Армения +374 или Россия +7 9xx), иначе пусто.
+    На городские номера WhatsApp/Telegram не работают."""
     d = re.sub(r"\D", "", phone or "")
-    return d if len(d) == 11 and d.startswith("374") and d[3:5] in MOBILE_CODES else ""
+    if len(d) == 11 and d.startswith("374") and d[3:5] in MOBILE_CODES:
+        return d
+    if len(d) == 11 and d.startswith("79"):
+        return d
+    return ""
 
 
 def link_buttons(p, lang, with_text=True):
@@ -166,9 +209,10 @@ def keyboard(p, lang, finished=False, with_text=True):
         kb.row(types.InlineKeyboardButton("✅ Написал", callback_data=f"w|{lang}|{pid}"),
                types.InlineKeyboardButton("⏭ Пропустить", callback_data=f"s|{lang}|{pid}"),
                types.InlineKeyboardButton("🚫 Не подходит", callback_data=f"r|{lang}|{pid}"))
-        other = "ru" if lang == "hy" else "hy"
-        kb.row(types.InlineKeyboardButton(f"Текст на {'русском' if other == 'ru' else 'армянском'}",
-                                          callback_data=f"{other}|{lang}|{pid}"))
+        others = [x for x in langs_for(p) if x != lang]
+        if others:  # для России язык один — кнопки переключения нет
+            kb.row(types.InlineKeyboardButton(LANG_BUTTON[others[0]],
+                                              callback_data=f"{others[0]}|{lang}|{pid}"))
     return kb
 
 
@@ -235,7 +279,8 @@ def cmd_start(m):
         return
     if not is_owner(m.from_user.id):
         return
-    msg = f"Ниша: <b>{esc(niche['title'])}</b>\n/next — следующий салон\n/stats — статистика"
+    msg = (f"Ниша: <b>{esc(niche['title'])}</b>\nРегионы: {esc(selected_names())}\n\n"
+           "/next — следующий салон\n/regions — выбрать регионы\n/stats — статистика")
     if not offer_filled():
         msg += f"\n\n⚠️ Заполните my_offer в файле niches/{NICHE}.json (что входит, цена, пример) и перезапустите бота."
     bot.reply_to(m, msg)
@@ -248,13 +293,16 @@ def cmd_next(m):
     if not offer_filled():
         bot.reply_to(m, f"Сначала заполните my_offer в niches/{NICHE}.json и перезапустите бота.")
         return
+    if not selected():
+        bot.reply_to(m, "Регионы не выбраны. Выберите их: /regions")
+        return
     p = take_next()
     if p is None:
-        new = db.first_with_status(NICHE, "new")
+        new = db.first_with_status(NICHE, "new", selected())
         if new is not None:
             bot.send_message(m.chat.id, "Пишу текст, подождите до минуты…")
             try:
-                make_text(new["id"], DEFAULT_LANG)
+                make_text(new["id"], default_lang(new))
                 db.change_status(new["id"], "new", "ready")
             except Exception as e:
                 bot.send_message(m.chat.id, f"Не получилось написать текст:\n{esc(e)}")
@@ -262,21 +310,23 @@ def cmd_next(m):
             p = take_next()
     wake.set()  # пусть фон пополнит очередь
     if p is None:
-        msg = "Очередь пуста, ищу новые салоны. Попробуйте /next через минуту."
-        msg += f"\nПоиск: {esc(state['search'])}"
+        msg = ("Очередь пуста, загружаю салоны выбранных регионов. "
+               "Попробуйте /next через минуту (большие города, например Москва, грузятся дольше).")
+        msg += f"\nРегионы: {esc(selected_names())}\nПоиск: {esc(state['search'])}"
         if state["error"]:
             msg += f"\nОшибка: {esc(state['error'])}"
         bot.send_message(m.chat.id, msg)
         return
-    send_card(m.chat.id, p, DEFAULT_LANG)
+    send_card(m.chat.id, p, default_lang(p))
 
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(m):
     if not is_owner(m.from_user.id):
         return
-    s = db.stats(NICHE)
+    s = db.stats(NICHE, selected())
     msg = (f"<b>{esc(niche['title'])}</b>\n"
+           f"Регионы: {esc(selected_names())}\n\n"
            f"Готово в очереди: {s.get('ready', 0)}\n"
            f"Найдено, ждут текста: {s.get('new', 0)}\n"
            f"Показано без ответа: {s.get('shown', 0)}\n"
@@ -288,6 +338,68 @@ def cmd_stats(m):
     if state["error"]:
         msg += f"\nОшибка: {esc(state['error'])}"
     bot.send_message(m.chat.id, msg)
+
+
+def regions_keyboard():
+    sel = set(selected())
+    kb = types.InlineKeyboardMarkup()
+    for code, country in COUNTRIES.items():
+        ids = [i for i, c in CITIES.items() if c.get("country") == code]
+        all_on = bool(ids) and all(i in sel for i in ids)
+        kb.row(types.InlineKeyboardButton(f"{'✅' if all_on else '⬜'} {country}: все города",
+                                          callback_data=f"regc|{code}"))
+        row = []
+        for i in ids:
+            row.append(types.InlineKeyboardButton(f"{'✅ ' if i in sel else ''}{CITIES[i]['name']}",
+                                                  callback_data=f"reg|{i}"))
+            if len(row) == 2:
+                kb.row(*row)
+                row = []
+        if row:
+            kb.row(*row)
+    kb.row(types.InlineKeyboardButton("Готово", callback_data="regdone"))
+    return kb
+
+
+@bot.message_handler(commands=["regions"])
+def cmd_regions(m):
+    if not is_owner(m.from_user.id):
+        return
+    bot.send_message(m.chat.id, "Выберите регионы для поиска (можно несколько), затем «Готово».\n"
+                                f"Сейчас: {esc(selected_names())}", reply_markup=regions_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("reg"))
+def on_region(c):
+    if not is_owner(c.from_user.id):
+        return
+    sel = set(selected())
+    if c.data == "regdone":
+        bot.answer_callback_query(c.id, "Сохранено")
+        msg = f"Регионы: <b>{esc(selected_names())}</b>\nТеперь /next"
+        if not sel:
+            msg = "Регионы не выбраны. Выберите хотя бы один: /regions"
+        bot.edit_message_text(msg, c.message.chat.id, c.message.message_id)
+        wake.set()
+        return
+    kind, value = c.data.split("|", 1)
+    if kind == "regc":  # вся страна: включить всё или выключить всё
+        ids = {i for i, x in CITIES.items() if x.get("country") == value}
+        sel = sel - ids if ids <= sel else sel | ids
+    elif value in sel:
+        sel.discard(value)
+    else:
+        sel.add(value)
+    set_selected(sel)
+    bot.answer_callback_query(c.id)
+    try:
+        bot.edit_message_text("Выберите регионы для поиска (можно несколько), затем «Готово».\n"
+                              f"Сейчас: {esc(selected_names())}", c.message.chat.id, c.message.message_id,
+                              reply_markup=regions_keyboard())
+    except ApiTelegramException as e:
+        if "not modified" not in str(e):
+            raise
+    wake.set()  # фон сразу начнёт загружать новые регионы
 
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -323,6 +435,15 @@ if __name__ == "__main__":
         log.info("OWNER_ID не задан: напишите боту /start, он пришлёт ваш ID.")
     if not offer_filled():
         log.warning("Заполните my_offer в niches/%s.json", NICHE)
+    try:  # меню команд в Telegram (кнопка «/» рядом с полем ввода)
+        bot.set_my_commands([
+            types.BotCommand("next", "Следующий салон"),
+            types.BotCommand("regions", "Выбрать регионы"),
+            types.BotCommand("stats", "Статистика"),
+            types.BotCommand("start", "Помощь"),
+        ])
+    except Exception:
+        log.warning("Не удалось обновить меню команд")
     threading.Thread(target=worker, daemon=True).start()
-    log.info("Бот запущен. Остановить: Ctrl+C")
+    log.info("Бот запущен. Регионы: %s", selected_names())
     bot.infinity_polling()

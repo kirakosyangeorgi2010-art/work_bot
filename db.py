@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS places (
     found_at      TEXT,
     updated_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS search_jobs (
     niche      TEXT,
     query      TEXT,
@@ -69,7 +73,33 @@ def connect(path=DB_FILE):
         _conn.execute("ALTER TABLE places ADD COLUMN category TEXT")
     except sqlite3.OperationalError:
         pass
+    try:  # база, созданная до появления регионов: тогда все салоны были из Еревана
+        _conn.execute("ALTER TABLE places ADD COLUMN city TEXT")
+        _conn.execute("UPDATE places SET city = 'yerevan' WHERE city IS NULL")
+    except sqlite3.OperationalError:
+        pass
     _conn.commit()
+
+
+# ---------- настройки (например, выбранные регионы) ----------
+
+def get_setting(key):
+    row = one("SELECT value FROM settings WHERE key = ?", (key,))
+    return row["value"] if row else None
+
+
+def set_setting(key, value):
+    run("INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+
+def _in_cities(cities):
+    """Кусок SQL «AND city IN (...)» и параметры для него. cities=None — без фильтра."""
+    if cities is None:
+        return "", ()
+    if not cities:
+        return " AND 0", ()
+    return f" AND city IN ({','.join('?' * len(cities))})", tuple(cities)
 
 
 def run(sql, params=()):
@@ -108,12 +138,12 @@ def add_place(niche, info, status):
     return run(
         """INSERT OR IGNORE INTO places
            (id, niche, name, address, phone, maps_url, social_url, rating,
-            reviews_count, last_review, reason, category, status, found_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            reviews_count, last_review, reason, category, city, status, found_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (info["id"], niche, info.get("name"), info.get("address"), info.get("phone"),
          info.get("maps_url"), info.get("social_url"), info.get("rating"),
          info.get("reviews_count"), info.get("last_review"), info.get("reason"),
-         info.get("category"), status, now(), now()),
+         info.get("category"), info.get("city"), status, now(), now()),
     )
 
 
@@ -144,19 +174,25 @@ def set_text(place_id, lang, text):
     run(f"UPDATE places SET {column} = ?, updated_at = ? WHERE id = ?", (text, now(), place_id))
 
 
-def first_with_status(niche, status):
+def first_with_status(niche, status, cities=None):
+    """Первый салон с этим статусом. cities — список ID городов (только из них) или None (из всех)."""
+    extra, params = _in_cities(cities)
     return one(
-        "SELECT * FROM places WHERE niche = ? AND status = ? ORDER BY found_at LIMIT 1",
-        (niche, status),
+        f"SELECT * FROM places WHERE niche = ? AND status = ?{extra} ORDER BY found_at LIMIT 1",
+        (niche, status, *params),
     )
 
 
-def count_status(niche, status):
-    return one("SELECT COUNT(*) FROM places WHERE niche = ? AND status = ?", (niche, status))[0]
+def count_status(niche, status, cities=None):
+    extra, params = _in_cities(cities)
+    return one(f"SELECT COUNT(*) FROM places WHERE niche = ? AND status = ?{extra}",
+               (niche, status, *params))[0]
 
 
-def stats(niche):
-    rows = many("SELECT status, COUNT(*) AS n FROM places WHERE niche = ? GROUP BY status", (niche,))
+def stats(niche, cities=None):
+    extra, params = _in_cities(cities)
+    rows = many(f"SELECT status, COUNT(*) AS n FROM places WHERE niche = ?{extra} GROUP BY status",
+                (niche, *params))
     return {r["status"]: r["n"] for r in rows}
 
 

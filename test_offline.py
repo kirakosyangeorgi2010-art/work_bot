@@ -52,5 +52,38 @@ os.environ.setdefault("TELEGRAM_TOKEN", "123:test")
 import bot  # noqa: E402
 assert bot.mobile_digits("+374 99 123456") == "37499123456"
 assert bot.mobile_digits("+374 10 123456") == "", "городской номер не для WhatsApp"
-print("OK   ссылки WhatsApp")
+assert bot.mobile_digits("+7 912 345-67-89") == "79123456789", "российский мобильный"
+assert bot.mobile_digits("+7 495 123-45-67") == "", "московский городской не для WhatsApp"
+print("OK   ссылки WhatsApp (Армения и Россия)")
+
+# Регионы: выбор сохраняется, /next берёт салоны только из выбранных городов
+import writer  # noqa: E402
+
+db.connect(os.path.join(tempfile.mkdtemp(), "r.db"))  # отдельная пустая база, настоящую не трогаем
+assert bot.selected() == ["yerevan"], "по умолчанию Ереван"
+bot.set_selected({"gyumri", "kazan"})
+assert set(bot.selected()) == {"gyumri", "kazan"}
+for pid, city, phone in [("p_yer", "yerevan", "+37499000001"), ("p_gyu", "gyumri", "+37499000002"),
+                         ("p_kaz", "kazan", "+79120000003")]:
+    db.add_place(bot.NICHE, dict(info, id=pid, city=city, phone=phone), "ready")
+got = []
+while (p := bot.take_next()) is not None:
+    got.append(p["id"])
+assert sorted(got) == ["p_gyu", "p_kaz"], got  # Ереван не выбран — его салон не показан
+# вернём показанные в очередь для проверок ниже
+for pid in got:
+    db.set_status(pid, "ready")
+print("OK   регионы: только выбранные города")
+
+kaz = db.get_place("p_kaz")
+assert bot.langs_for(kaz) == ["ru"] and bot.default_lang(kaz) == "ru"
+assert bot.langs_for(db.get_place("p_gyu")) == ["hy", "ru"]
+ru_text, _ = writer.generate(niche, kaz, "ru")
+assert "Яндекс" in ru_text and "армянск" not in ru_text, "шаблон для России"
+am_text, _ = writer.generate(niche, db.get_place("p_gyu"), "ru")
+assert "в Гюмри" in am_text and "{" not in am_text, "шаблон для Армении с городом"
+kb = bot.keyboard(dict(kaz, text_ru=ru_text), "ru")
+assert not any(b.callback_data and b.callback_data.startswith("hy|") for row in kb.keyboard for b in row), \
+    "для России не должно быть кнопки армянского текста"
+print("OK   шаблоны и язык по стране")
 print("\nВсё в порядке.")

@@ -106,14 +106,16 @@ def check_place(p, flt):
     return True, info
 
 
-def find_more(niche_id, niche):
-    """Загружает следующий город из файла ниши (или обновляет, если вышел новый выпуск Overture).
-    Возвращает число новых подходящих салонов или EXHAUSTED."""
+def find_more(niche_id, niche, city_ids):
+    """Загружает следующий из выбранных городов (city_ids), который ещё не загружен
+    из последнего выпуска Overture. Возвращает число новых подходящих салонов или EXHAUSTED."""
     release = latest_release()
     s = niche["search"]
     for city in s["cities"]:
+        if city["id"] not in city_ids:
+            continue
         job = db.one("SELECT page_token FROM search_jobs WHERE niche = ? AND query = ?",
-                     (niche_id, city["name"]))
+                     (niche_id, city["id"]))
         if job is not None and job["page_token"] == release:
             continue  # этот город уже загружен из последнего выпуска
         added = 0
@@ -121,13 +123,14 @@ def find_more(niche_id, niche):
             if db.place_exists(p["id"]):
                 continue
             ok, info = check_place(p, niche["filter"])
+            info["city"] = city["id"]
             if ok and db.phone_taken(niche_id, info["phone"]):
                 ok, info["reason"] = False, "дубль: этот телефон уже есть"
             db.add_place(niche_id, info, "new" if ok else "filtered_out")
             added += ok
-        db.add_job(niche_id, city["name"])
-        db.update_job(niche_id, city["name"], release)
-        db.run("UPDATE search_jobs SET done = 1 WHERE niche = ? AND query = ?", (niche_id, city["name"]))
+        db.add_job(niche_id, city["id"])
+        db.update_job(niche_id, city["id"], release)
+        db.run("UPDATE search_jobs SET done = 1 WHERE niche = ? AND query = ?", (niche_id, city["id"]))
         return added
     return EXHAUSTED
 
@@ -135,9 +138,13 @@ def find_more(niche_id, niche):
 if __name__ == "__main__":
     import json
 
+    import sys
+
     niche = json.load(open("niches/beauty_salons.json", encoding="utf-8"))
     release = latest_release()
-    city = niche["search"]["cities"][0]
+    # python finder.py gyumri  — проверить конкретный город (ID из файла ниши)
+    want = sys.argv[1] if len(sys.argv) > 1 else niche["search"]["cities"][0]["id"]
+    city = next(c for c in niche["search"]["cities"] if c["id"] == want)
     print(f"Выпуск Overture: {release}. Скачиваю {city['name']}…")
     places = download_city(release, city["bbox"], niche["search"]["categories"])
     good = [info for ok, info in (check_place(p, niche["filter"]) for p in places) if ok]

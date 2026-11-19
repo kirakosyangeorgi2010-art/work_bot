@@ -26,13 +26,20 @@ def get(p, key):
     return p[key] if key in p.keys() else None
 
 
+def city_of(niche, place):
+    """Город салона из файла ниши (по ID в базе). Если не найден — первый город."""
+    cities = niche["search"]["cities"]
+    return next((c for c in cities if c["id"] == get(place, "city")), cities[0])
+
+
 def build_prompt(niche, place, lang):
     t = niche["text"]
     offer = niche["my_offer"]
     category = t.get("category_names", {}).get(get(place, "category") or "", "салон красоты")
+    city = city_of(niche, place)
 
-    facts = [f"название: {place['name']}", f"тип: {category}",
-             f"адрес: {(get(place, 'address') or '').strip() or 'Ереван'}"]
+    facts = [f"название: {place['name']}", f"тип: {category}", f"город: {city['name']}",
+             f"адрес: {(get(place, 'address') or '').strip() or city['name']}"]
     social = get(place, "social_url")
     if social:
         net = "Instagram" if "instagram" in social else "Facebook" if "facebook" in social else "страница в соцсети"
@@ -105,7 +112,9 @@ def generate(niche, place, lang):
     """Возвращает (текст, кто написал). Если оба ИИ недоступны — выбрасывает ошибку."""
     t = niche["text"]
     if t.get("mode", "template") == "template":
-        return t["templates"][lang].replace("{name}", place["name"]), "шаблон"
+        city = city_of(niche, place)
+        tpl = t["templates"][city.get("country", "AM")][lang]
+        return tpl.replace("{name}", place["name"]).replace("{in_city}", city.get("in_ru", "")), "шаблон"
     prompt = build_prompt(niche, place, lang)
     errors = []
     order = ["claude", "gemini"] if os.getenv("AI_ORDER", "claude") == "claude" else ["gemini", "claude"]
